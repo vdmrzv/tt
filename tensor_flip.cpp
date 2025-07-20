@@ -151,25 +151,24 @@ void tensor_flip_cpu(
 }
 
 int main(int argc, char** argv) {
-    std::vector<uint32_t> dims_to_flip = {2, 3};
 
     constexpr uint32_t N = 1;
     constexpr uint32_t C = 3;
     constexpr uint32_t H = 96;
     constexpr uint32_t W = 96;
     constexpr uint32_t numel = N * C * H * W;
+    constexpr uint32_t element_size = sizeof(uint32_t);
+    const std::vector<uint32_t> input_shape = {N, C, H, W};
+    const std::vector<uint32_t> dims_to_flip = {2, 3};
 
     std::mt19937 gen(69);
     std::uniform_int_distribution<int> dist(0, 10);
-
     std::vector<uint32_t> src_vec(numel, 0);
-    std::vector<uint32_t> shape = {N, C, H, W};
-    for (auto& v : src_vec) v = dist(gen);
-
     std::vector<uint32_t> result_tt(numel, 0);
     std::vector<uint32_t> result_cpu(numel, 0);
+    for (auto& v : src_vec) v = dist(gen);
 
-    tensor_flip_cpu(src_vec, result_cpu, shape, dims_to_flip);
+    tensor_flip_cpu(src_vec, result_cpu, input_shape, dims_to_flip);
 
     // tt part
     constexpr int device_id = 0;
@@ -177,11 +176,10 @@ int main(int argc, char** argv) {
     Program program = CreateProgram();
     CommandQueue& cq = device->command_queue();
 
-    ttnn::Shape input_shape({N, C, H, W});
-    ttnn::MemoryConfig memory_config(ttnn::TensorMemoryLayout::INTERLEAVED, ttnn::BufferType::DRAM);
     ttnn::PageConfig page_config(ttnn::Layout::TILE);
+    ttnn::MemoryConfig memory_config(ttnn::TensorMemoryLayout::INTERLEAVED, ttnn::BufferType::DRAM);
     ttnn::TensorLayout layout_config(ttnn::DataType::UINT32, page_config, memory_config);
-    ttnn::TensorSpec tensor_spec(input_shape, layout_config);
+    ttnn::TensorSpec tensor_spec(ttnn::Shape(input_shape), layout_config);
 
     ttnn::Tensor input_tensor = ttnn::Tensor::from_vector(src_vec, tensor_spec);
     input_tensor = input_tensor.to_device(device);
@@ -191,29 +189,14 @@ int main(int argc, char** argv) {
 
     uint32_t rank = input_tensor.logical_shape().rank();
     uint32_t num_tiles = get_num_tiles(input_tensor);
+    const auto& tile_shape = input_tensor.tensor_spec().tile().get_tile_shape();
+    const auto& face_shape = input_tensor.tensor_spec().tile().get_face_shape();
     ttnn::Shape input_tile_shape = get_tiled_shape(input_tensor);
     ttnn::SmallVector<uint32_t> input_tile_strides = get_strides(input_tile_shape);
 
     fmt::print("input_shape: {}\n", input_shape);
     fmt::print("input_tile_shape: {}\n", input_tile_shape);
     fmt::print("input_tile_strides: {}\n", input_tile_strides);
-
-    // Split the work to all available cores
-    auto core_grid = device->compute_with_storage_grid_size();
-    auto [num_cores,
-        all_cores,
-        core_group_1,
-        core_group_2,
-        num_tiles_per_core_group_1,
-        num_tiles_per_core_group_2] = split_work_to_cores(core_grid, num_tiles);
-
-    fmt::print("core_grid: {}\n", core_grid);
-    fmt::print("num_cores: {}\n", num_cores);
-    fmt::print("all_cores: {}\n", all_cores);
-    fmt::print("core_group_1: {}\n", core_group_1);
-    fmt::print("core_group_2: {}\n", core_group_2);
-    fmt::print("num_tiles_per_core_group_1: {}\n", num_tiles_per_core_group_1);
-    fmt::print("num_tiles_per_core_group_2: {}\n", num_tiles_per_core_group_2);
 
     // Configure Circular Buffers
     constexpr uint32_t tile_size = sizeof(uint32_t) * TILE_HW;
@@ -226,13 +209,24 @@ int main(int argc, char** argv) {
         CircularBufferConfig(cb_size, {{CBIndex::c_0, cb_data_format}})
             .set_page_size(CBIndex::c_0, tile_size));
 
-    // Create kernels
-    std::vector<uint32_t> reader_ct_args = {(uint32_t)input_tensor.buffer()->is_dram(), rank};
+    // ------------------------------------------------------------------------
+    // Setup compile-time arguments and create kernels
+    // ------------------------------------------------------------------------
+    std::vector<uint32_t> reader_compile_time_args = {
+        (uint32_t)input_tensor.buffer()->is_dram(),
+        rank,
+        sizeof(uint32_t),
+        tile_shape[0],
+        tile_shape[1],
+        face_shape[0],
+        face_shape[1]  
+    };
+
     auto reader_id = CreateKernel(
         program,
         OVERRIDE_KERNEL_PREFIX "tensor_flip/kernels/reader_kernel.cpp",
         all_cores,
-        ReaderDataMovementConfig(reader_ct_args)
+        ReaderDataMovementConfig(reader_compile_time_args)
     );
 
     std::vector<uint32_t> writer_ct_args = {(uint32_t)output_tensor.buffer()->is_dram()};
@@ -278,9 +272,26 @@ int main(int argc, char** argv) {
             src_tile_id, dst_tile_id, src_multi_dim, dst_multi_dim);
     }
 
+    // Split the work to all available cores
+    auto core_grid = device->compute_with_storage_grid_size();
+    auto [num_cores,
+        all_cores,
+        core_group_1,
+        core_group_2,
+        num_tiles_per_core_group_1,
+        num_tiles_per_core_group_2] = split_work_to_cores(core_grid, num_tiles);
+
+    fmt::print("core_grid: {}\n", core_grid);
+    fmt::print("num_cores: {}\n", num_cores);
+    fmt::print("all_cores: {}\n", all_cores);
+    fmt::print("core_group_1: {}\n", core_group_1);
+    fmt::print("core_group_2: {}\n", core_group_2);
+    fmt::print("num_tiles_per_core_group_1: {}\n", num_tiles_per_core_group_1);
+    fmt::print("num_tiles_per_core_group_2: {}\n", num_tiles_per_core_group_2);
+
     // Set Runtime Arguments for Kernels
-    std::vector<uint32_t> reader_rt_args = {input_tensor.buffer()->address(), 0, 0};
-    std::vector<uint32_t> writer_rt_args = {output_tensor.buffer()->address(), 0, 0};
+    std::vector<uint32_t> reader_runtime_args = {input_tensor.buffer()->address(), 0, 0};
+    std::vector<uint32_t> writer_runtime_args = {output_tensor.buffer()->address(), 0, 0};
 
     // reader_rt_args.insert(
     //     reader_runtime_args.end(),
@@ -295,12 +306,12 @@ int main(int argc, char** argv) {
             for (const auto& core : range) {
                 end_tile += tiles_per_core;
 
-                reader_rt_args[1] = start_tile;
-                reader_rt_args[2] = end_tile;
+                reader_runtime_args[1] = start_tile;
+                reader_runtime_args[2] = end_tile;
                 SetRuntimeArgs(program, reader_id, core, reader_rt_args);
 
-                writer_rt_args[1] = start_tile;
-                writer_rt_args[2] = end_tile;
+                writer_runtime_args[1] = start_tile;
+                writer_runtime_args[2] = end_tile;
                 SetRuntimeArgs(program, writer_id, core, writer_rt_args);
 
                 start_tile += tiles_per_core;
