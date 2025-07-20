@@ -3,7 +3,7 @@
 
 
 inline uint32_t calc_src_tile_index(
-    uint32_t tile_id,
+    uint32_t src_tile_id,
     uint32_t rank,
     uint32_t* dims_to_flip,
     uint32_t* input_tile_shape,
@@ -87,13 +87,13 @@ void kernel_main() {
         // calculate src_tile_id that should be placed 
 
         // inline uint32_t calc_src_tile_index(
-        //     uint32_t tile_id,
+        //     uint32_t src_tile_id,
         //     uint32_t rank,
         //     uint32_t* dims_to_flip,
         //     uint32_t* input_tile_shape,
         //     uint32_t* input_tile_strides) {
         uint32_t src_tile_linear_id = calc_src_tile_index(
-            tile_id, dims_to_flip, input_tile_shape, input_tile_strides);
+            tile_id, RANK, dims_to_flip, input_tile_shape, input_tile_strides);
         
         uint32_t dest_tr0_l1 = get_write_ptr(cb_id);
         uint64_t src_bank_addr = get_noc_addr(src_tile_linear_id, s0);

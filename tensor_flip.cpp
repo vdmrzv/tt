@@ -31,40 +31,40 @@ using namespace tt;
 using namespace tt::tt_metal;
 using namespace tt::constants;
 
-uint32_t calc_src_tile_index(
-    std::vector<uint32_t>& dims_to_flip
-    uint32_t src_tile_id,
-    uint32_t rank
-    ttnn::Shape& input_tile_shape,
-    ttnn::SmallVector<uint32_t>& input_tile_strides
-) {
-    size_t remaining = src_tile_id;
-    std::vector<uint32_t> src_multi_dim(rank, 0);
-    std::vector<uint32_t> dst_multi_dim(rank, 0);
+// uint32_t calc_src_tile_index(
+//     std::vector<uint32_t>& dims_to_flip
+//     uint32_t src_tile_id,
+//     uint32_t rank
+//     ttnn::Shape& input_tile_shape,
+//     ttnn::SmallVector<uint32_t>& input_tile_strides
+// ) {
+//     size_t remaining = src_tile_id;
+//     std::vector<uint32_t> src_multi_dim(rank, 0);
+//     std::vector<uint32_t> dst_multi_dim(rank, 0);
 
-    for (uint32_t i = 0; i < rank; ++i) {
-        size_t dim = rank - i;
-        src_multi_dim[dim] = remaining % input_tile_shape[i];
+//     for (uint32_t i = 0; i < rank; ++i) {
+//         size_t dim = rank - i;
+//         src_multi_dim[dim] = remaining % input_tile_shape[i];
 
-        bool should_flip = std::find(
-            dims_to_flip.begin(), dims_to_flip.end(), dim) != dims_to_flip.end();
-        if (should_flip) {
-            // calculate dst tile multi dimension coordinate
-            dst_multi_dim[dim] = input_tile_shape[dim] - src_multi_dim[dim] - 1;
-        } else {
-            dst_multi_dim[dim] = src_multi_dim[dim];
-        }
+//         bool should_flip = std::find(
+//             dims_to_flip.begin(), dims_to_flip.end(), dim) != dims_to_flip.end();
+//         if (should_flip) {
+//             // calculate dst tile multi dimension coordinate
+//             dst_multi_dim[dim] = input_tile_shape[dim] - src_multi_dim[dim] - 1;
+//         } else {
+//             dst_multi_dim[dim] = src_multi_dim[dim];
+//         }
 
-        remaining /= input_tile_shape[i];
-    }
+//         remaining /= input_tile_shape[i];
+//     }
 
-    // dst tile multi dimension coordinate -> dst_linear_tile_id
-    uint32_t dst_tile_id = 0;
-    for (uint32_t j = 0; j < rank; ++j) {
-        dst_tile_id += dst_multi_dim[j] * input_tile_strides[j];
-    }
-    return dst_tile_id;
-}
+//     // dst tile multi dimension coordinate -> dst_linear_tile_id
+//     uint32_t dst_tile_id = 0;
+//     for (uint32_t j = 0; j < rank; ++j) {
+//         dst_tile_id += dst_multi_dim[j] * input_tile_strides[j];
+//     }
+//     return dst_tile_id;
+// }
 
 
 uint32_t tile_volume(const ttnn::Tensor& input_tensor) {
@@ -78,7 +78,7 @@ uint32_t get_num_tiles(const ttnn::Tensor& input_tensor) {
     return shape.volume() / tile_vol;
 }
 
-ttnn::Shape get_tiled_shape(const ttnn::Tensor& input_tensor) {
+static ttnn::SmallVector<uint32_t> get_tiled_shape(const ttnn::Tensor& input_tensor) {
     const auto& tile_shape = input_tensor.tensor_spec().tile().get_tile_shape();
     const auto& shape = input_tensor.padded_shape();
     ttnn::SmallVector<uint32_t> tiled_shape;
@@ -94,14 +94,13 @@ ttnn::Shape get_tiled_shape(const ttnn::Tensor& input_tensor) {
         }
         tiled_shape.push_back(dim);
     }
-    auto res = ttnn::Shape(tiled_shape);
-    return res;
+    return tiled_shape;
 }
 
-ttnn::SmallVector<uint32_t> get_strides(const ttnn::Shape& shape) {
-    ttnn::SmallVector<uint32_t> strides(shape.rank());
-    strides[shape.rank() - 1] = 1;
-    for (int i = shape.rank() - 2; i >= 0; i--) {
+static ttnn::SmallVector<uint32_t> get_tile_strides(const ttnn::SmallVector<uint32_t>& shape) {
+    ttnn::SmallVector<uint32_t> strides(shape.size());
+    strides[shape.size() - 1] = 1;
+    for (int i = shape.size() - 2; i >= 0; i--) {
         strides[i] = strides[i + 1] * shape[i + 1];
     }
     return strides;
@@ -228,14 +227,35 @@ int main(int argc, char** argv) {
     uint32_t num_tiles = get_num_tiles(input_tensor);
     const auto& tile_shape = input_tensor.tensor_spec().tile().get_tile_shape();
     const auto& face_shape = input_tensor.tensor_spec().tile().get_face_shape();
-    ttnn::Shape input_tile_shape = get_tiled_shape(input_tensor);
-    ttnn::SmallVector<uint32_t> input_tile_strides = get_strides(input_tile_shape);
+    ttnn::SmallVector<uint32_t> input_tile_shape = get_tiled_shape(input_tensor);
+    ttnn::SmallVector<uint32_t> input_tile_strides = get_tile_strides(input_tile_shape);
 
     fmt::print("input_shape: {}\n", input_shape);
     fmt::print("input_tile_shape: {}\n", input_tile_shape);
     fmt::print("input_tile_strides: {}\n", input_tile_strides);
 
-    // Configure Circular Buffers
+    // ------------------------------------------------------------------------
+    // 4) Split work to all available cores
+    // ------------------------------------------------------------------------
+    auto core_grid = device->compute_with_storage_grid_size();
+    auto [num_cores,
+        all_cores,
+        core_group_1,
+        core_group_2,
+        num_tiles_per_core_group_1,
+        num_tiles_per_core_group_2] = split_work_to_cores(core_grid, num_tiles);
+
+    fmt::print("core_grid: {}\n", core_grid);
+    fmt::print("num_cores: {}\n", num_cores);
+    fmt::print("all_cores: {}\n", all_cores);
+    fmt::print("core_group_1: {}\n", core_group_1);
+    fmt::print("core_group_2: {}\n", core_group_2);
+    fmt::print("num_tiles_per_core_group_1: {}\n", num_tiles_per_core_group_1);
+    fmt::print("num_tiles_per_core_group_2: {}\n", num_tiles_per_core_group_2);
+
+    // ------------------------------------------------------------------------
+    // 3) Configure Circular Buffers
+    // ------------------------------------------------------------------------
     const auto cb_data_format = tt::DataFormat::UInt32;
     uint32_t cb_size = 2 * TILE_SIZE; // double buffering
 
@@ -243,7 +263,7 @@ int main(int argc, char** argv) {
         program,
         all_cores,
         CircularBufferConfig(cb_size, {{CBIndex::c_0, cb_data_format}})
-            .set_page_size(CBIndex::c_0, tile_size));
+            .set_page_size(CBIndex::c_0, TILE_SIZE));
 
     // ------------------------------------------------------------------------
     // 2) Set compile-time arguments and create kernels
@@ -277,28 +297,6 @@ int main(int argc, char** argv) {
         std::make_pair(core_group_1, num_tiles_per_core_group_1),
         std::make_pair(core_group_2, num_tiles_per_core_group_2)};
 
-    // calc_src_tile_index()
-
-
-    // ------------------------------------------------------------------------
-    // 4) Split work to all available cores
-    // ------------------------------------------------------------------------
-    auto core_grid = device->compute_with_storage_grid_size();
-    auto [num_cores,
-        all_cores,
-        core_group_1,
-        core_group_2,
-        num_tiles_per_core_group_1,
-        num_tiles_per_core_group_2] = split_work_to_cores(core_grid, num_tiles);
-
-    fmt::print("core_grid: {}\n", core_grid);
-    fmt::print("num_cores: {}\n", num_cores);
-    fmt::print("all_cores: {}\n", all_cores);
-    fmt::print("core_group_1: {}\n", core_group_1);
-    fmt::print("core_group_2: {}\n", core_group_2);
-    fmt::print("num_tiles_per_core_group_1: {}\n", num_tiles_per_core_group_1);
-    fmt::print("num_tiles_per_core_group_2: {}\n", num_tiles_per_core_group_2);
-
     // ------------------------------------------------------------------------
     // 5) Set Runtime Arguments for Kernels
     // ------------------------------------------------------------------------
@@ -329,6 +327,7 @@ int main(int argc, char** argv) {
             }
         }
     }
+    return 0;
 
     fmt::print("all_close: {}\n", ttnn::allclose<uint32_t>(input_tensor.cpu(), output_tensor.cpu(), 1e-5f, 1e-5f));
     fmt::print("enqueue program\n");
