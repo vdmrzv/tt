@@ -16,12 +16,13 @@
 
 #include "ttnn/tensor/tensor.hpp"
 #include "ttnn/tensor/types.hpp"
+#include "ttnn/operations/data_movement/slice/slice.hpp"
+#include "ttnn/operations/eltwise/unary/unary.hpp"
+#include "ttnn/operations/eltwise/binary/binary.hpp"
 #include "ttnn/operations/functions.hpp"
 #include "ttnn/operations/generic/generic_op.hpp"
-#include "ttnn/operations/eltwise/unary/unary.hpp"
-#include "ttnn/operations/matmul/matmul.hpp"
-#include "ttnn/operations/eltwise/binary/binary.hpp"
-#include "ttnn/operations/reduction/argmax/argmax.hpp"
+// #include "ttnn/operations/matmul/matmul.hpp"
+// #include "ttnn/operations/reduction/argmax/argmax.hpp"
 
 #ifndef OVERRIDE_KERNEL_PREFIX
 #define OVERRIDE_KERNEL_PREFIX ""
@@ -184,9 +185,9 @@ void tensor_flip_cpu(
 
 int main(int argc, char** argv) {
     constexpr uint32_t N = 1;
-    constexpr uint32_t C = 3;
-    constexpr uint32_t H = 96;
-    constexpr uint32_t W = 96;
+    constexpr uint32_t C = 2;
+    constexpr uint32_t H = 128;
+    constexpr uint32_t W = 224;
     constexpr uint32_t NUMEL = N * C * H * W;
     constexpr uint32_t ELEMENT_SIZE = sizeof(uint32_t);
     constexpr uint32_t TILE_SIZE = ELEMENT_SIZE * TILE_HW;
@@ -199,8 +200,9 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> result_cpu(NUMEL, 0);
 
     std::mt19937 gen(69);
-    std::uniform_int_distribution<int> dist(0, 10);
+    std::uniform_int_distribution<int> dist(0, 9);
     for (auto& v : src_vec) v = dist(gen);
+    pprint(src_vec, {1, 32, 32});
 
     tensor_flip_cpu(src_vec, result_cpu, input_shape, dims_to_flip);
 
@@ -216,12 +218,22 @@ int main(int argc, char** argv) {
     ttnn::MemoryConfig memory_config(ttnn::TensorMemoryLayout::INTERLEAVED, ttnn::BufferType::DRAM);
     ttnn::TensorLayout layout_config(ttnn::DataType::UINT32, page_config, memory_config);
     ttnn::TensorSpec tensor_spec(ttnn::Shape(input_shape), layout_config);
-
     ttnn::Tensor input_tensor = ttnn::Tensor::from_vector(src_vec, tensor_spec);
     input_tensor = input_tensor.to_device(device);
-
     ttnn::Tensor output_tensor = ttnn::Tensor::from_vector(result_tt, tensor_spec);
     output_tensor = output_tensor.to_device(device);
+
+    ttnn::Tensor sliced_input_tensor = ttnn::slice(
+                ttnn::DefaultQueueId,
+                input_tensor,
+                ttnn::SmallVector<uint32_t>{0, 0, 0, 0},  // Start
+                ttnn::SmallVector<uint32_t>{1, 1, 32, 32}, // End
+                ttnn::SmallVector<uint32_t>{1, 1, 1, 1}); // Step
+    // std::string tensor_str = sliced_input_tensor.write_to_string();  
+    // fmt::print("sliced_input_tensor: ", tensor_str);
+
+    std::vector<uint32_t> values = sliced_input_tensor.to_vector<uint32_t>();
+    pprint(values, {1, 32, 32});
 
     uint32_t rank = input_tensor.logical_shape().rank();
     uint32_t num_tiles = get_num_tiles(input_tensor);
@@ -327,7 +339,6 @@ int main(int argc, char** argv) {
             }
         }
     }
-    return 0;
 
     fmt::print("all_close: {}\n", ttnn::allclose<uint32_t>(input_tensor.cpu(), output_tensor.cpu(), 1e-5f, 1e-5f));
     fmt::print("enqueue program\n");

@@ -13,21 +13,21 @@ inline uint32_t calc_src_tile_index(
     // 2. Convert multi-dimensional index to linear index
 
     size_t remaining = src_tile_id;
-    std::vector<uint32_t> src_multi_dim(rank, 0);
-    std::vector<uint32_t> dst_multi_dim(rank, 0);
+    uint32_t src_multi_dim[rank];
+    uint32_t dst_multi_dim[rank];
 
     for (uint32_t i = 0; i < rank; ++i) {
         size_t dim = rank - i;
         src_multi_dim[dim] = remaining % input_tile_shape[i];
 
-        bool should_flip = std::find(
-            dims_to_flip.begin(), dims_to_flip.end(), dim) != dims_to_flip.end();
-        if (should_flip) {
-            // calculate dst tile multi dimension coordinate
-            dst_multi_dim[dim] = input_tile_shape[dim] - src_multi_dim[dim] - 1;
-        } else {
-            dst_multi_dim[dim] = src_multi_dim[dim];
-        }
+        // bool should_flip = std::find(
+        //     dims_to_flip.begin(), dims_to_flip.end(), dim) != dims_to_flip.end();
+        // if (should_flip) {
+        //     // calculate dst tile multi dimension coordinate
+        //     dst_multi_dim[dim] = input_tile_shape[dim] - src_multi_dim[dim] - 1;
+        // } else {
+        //     dst_multi_dim[dim] = src_multi_dim[dim];
+        // }
 
         remaining /= input_tile_shape[i];
     }
@@ -44,7 +44,7 @@ void kernel_main() {
     // ------------------------------------------------------------------------
     // 1) Compile-time arguments
     // ------------------------------------------------------------------------
-    constexpr bool src0_is_dram = static_cast<bool>(get_compile_time_arg_val(0));
+    constexpr bool src_is_dram = static_cast<bool>(get_compile_time_arg_val(0));
     constexpr uint32_t RANK = get_compile_time_arg_val(1);
     constexpr uint32_t element_size = get_compile_time_arg_val(2);
     constexpr uint32_t TILE_HEIGHT = get_compile_time_arg_val(3);
@@ -68,7 +68,11 @@ void kernel_main() {
     // ------------------------------------------------------------------------
     // 3) Derived constants
     // ------------------------------------------------------------------------
+    constexpr uint32_t FACE_HW = FACE_HEIGHT * FACE_WIDTH;
+    constexpr uint32_t FACE_HW_BYTES = FACE_HW * element_size;
+    constexpr uint32_t NUM_FACES_W = TILE_WIDTH / FACE_WIDTH;
     constexpr uint32_t SUBTILE_LINE_BYTES = FACE_WIDTH * element_size;
+    constexpr uint32_t FACE_H_STRIDE_BYTES = NUM_FACES_W * FACE_HW_BYTES;
 
     constexpr uint32_t onetile = 1;
     constexpr uint32_t cb_id = tt::CBIndex::c_0;
@@ -82,44 +86,21 @@ void kernel_main() {
 
     for (uint32_t tile_id = start_tile; tile_id < end_tile; ++tile_id) {
         cb_reserve_back(cb_id, onetile);
+        uint32_t l1_buf_addr = get_write_ptr(cb_id);
+        uint64_t face_base_addr = get_noc_addr(tile_id, s0, 0);
 
-        // tile_id = dst_tile_id because we writing to output in order
-        // calculate src_tile_id that should be placed 
-
-        // inline uint32_t calc_src_tile_index(
-        //     uint32_t src_tile_id,
-        //     uint32_t rank,
-        //     uint32_t* dims_to_flip,
-        //     uint32_t* input_tile_shape,
-        //     uint32_t* input_tile_strides) {
-        uint32_t src_tile_linear_id = calc_src_tile_index(
-            tile_id, RANK, dims_to_flip, input_tile_shape, input_tile_strides);
-        
-        uint32_t dest_tr0_l1 = get_write_ptr(cb_id);
-        uint64_t src_bank_addr = get_noc_addr(src_tile_linear_id, s0);
-
-        // Intra tile flip
-        uint64_t subtile_addr = src_bank_addr;
-        for (uint32_t sub = 0; sub < 4; sub++) {
-
-            // Read subtile line by line
-            for (uint32_t c16 = 0; c16 < FACE_HEIGHT; c16++) {
-                noc_async_read(subtile_addr, dest_tr0_l1, SUBTILE_LINE_BYTES);
-                if (is_horizontal_flip) {
-                    // flip h_order
+        uint64_t row_offset = 0;
+        for (uint32_t face = 0; face < 1; face++) {
+            for (uint32_t face_row = 0; face_row < FACE_HEIGHT; face_row++) {
+                noc_async_read(face_base_addr + row_offset, l1_buf_addr, SUBTILE_LINE_BYTES);
+                for (uint32_t face_col = 0; face_col < FACE_WIDTH; ++face_col) {
+                    DPRINT << uint32_t(reinterpret_cast<uint32_t*>(l1_buf_addr)[face_col]) << ", ";
                 }
+                DPRINT << ENDL();
+                l1_buf_addr += SUBTILE_LINE_BYTES;
+                row_offset += SUBTILE_LINE_BYTES;
             }
-            DPRINT << uint32_t( reinterpret_cast<uint16_t*>( dest_tr0_l1 )[0] ) << ENDL();
-
-            // Intra subtile flip
-
-            if (sub == 1) {
-                // subtile_offset += (HW2 << 4);
-            }
-            subtile_src_addrs += subtile_offset;
         }
-
-
         cb_push_back(cb_id, onetile);
     }
 }
