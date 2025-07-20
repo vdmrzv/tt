@@ -89,10 +89,11 @@ void kernel_main() {
         uint32_t l1_buf_addr = get_write_ptr(cb_id);
         uint64_t face_base_addr = get_noc_addr(tile_id, s0, 0);
 
-        uint64_t row_offset = 0;
-        for (uint32_t face = 0; face < 1; face++) {
+        uint64_t face_offset = 0;
+        for (uint32_t face = 0; face < 4; face++) {
+            uint64_t row_offset = 0;
             for (uint32_t face_row = 0; face_row < FACE_HEIGHT; face_row++) {
-                noc_async_read(face_base_addr + row_offset, l1_buf_addr, SUBTILE_LINE_BYTES);
+                noc_async_read(face_base_addr + face_offset + row_offset, l1_buf_addr, SUBTILE_LINE_BYTES);
                 for (uint32_t face_col = 0; face_col < FACE_WIDTH; ++face_col) {
                     DPRINT << uint32_t(reinterpret_cast<uint32_t*>(l1_buf_addr)[face_col]) << ", ";
                 }
@@ -100,6 +101,8 @@ void kernel_main() {
                 l1_buf_addr += SUBTILE_LINE_BYTES;
                 row_offset += SUBTILE_LINE_BYTES;
             }
+            face_offset += FACE_HEIGHT * SUBTILE_LINE_BYTES;
+            DPRINT << ENDL();
         }
         cb_push_back(cb_id, onetile);
     }
