@@ -14,9 +14,6 @@
 #include <tt-metalium/tilize_utils.hpp>
 #include <tt-metalium/work_split.hpp>
 
-// #include "ttnn/tensor/tensor.hpp"
-// #include "ttnn/operations/core/core.hpp"
-
 #include "ttnn/tensor/tensor.hpp"
 #include "ttnn/tensor/types.hpp"
 #include "ttnn/operations/functions.hpp"
@@ -33,6 +30,42 @@
 using namespace tt;
 using namespace tt::tt_metal;
 using namespace tt::constants;
+
+uint32_t calc_src_tile_index(
+    std::vector<uint32_t>& dims_to_flip
+    uint32_t src_tile_id,
+    uint32_t rank
+    ttnn::Shape& input_tile_shape,
+    ttnn::SmallVector<uint32_t>& input_tile_strides
+) {
+    size_t remaining = src_tile_id;
+    std::vector<uint32_t> src_multi_dim(rank, 0);
+    std::vector<uint32_t> dst_multi_dim(rank, 0);
+
+    for (uint32_t i = 0; i < rank; ++i) {
+        size_t dim = rank - i;
+        src_multi_dim[dim] = remaining % input_tile_shape[i];
+
+        bool should_flip = std::find(
+            dims_to_flip.begin(), dims_to_flip.end(), dim) != dims_to_flip.end();
+        if (should_flip) {
+            // calculate dst tile multi dimension coordinate
+            dst_multi_dim[dim] = input_tile_shape[dim] - src_multi_dim[dim] - 1;
+        } else {
+            dst_multi_dim[dim] = src_multi_dim[dim];
+        }
+
+        remaining /= input_tile_shape[i];
+    }
+
+    // dst tile multi dimension coordinate -> dst_linear_tile_id
+    uint32_t dst_tile_id = 0;
+    for (uint32_t j = 0; j < rank; ++j) {
+        dst_tile_id += dst_multi_dim[j] * input_tile_strides[j];
+    }
+    return dst_tile_id;
+}
+
 
 uint32_t tile_volume(const ttnn::Tensor& input_tensor) {
     const auto& tile_shape = input_tensor.tensor_spec().tile().get_tile_shape();
@@ -151,26 +184,30 @@ void tensor_flip_cpu(
 }
 
 int main(int argc, char** argv) {
-
     constexpr uint32_t N = 1;
     constexpr uint32_t C = 3;
     constexpr uint32_t H = 96;
     constexpr uint32_t W = 96;
-    constexpr uint32_t numel = N * C * H * W;
-    constexpr uint32_t element_size = sizeof(uint32_t);
+    constexpr uint32_t NUMEL = N * C * H * W;
+    constexpr uint32_t ELEMENT_SIZE = sizeof(uint32_t);
+    constexpr uint32_t TILE_SIZE = ELEMENT_SIZE * TILE_HW;
+
     const std::vector<uint32_t> input_shape = {N, C, H, W};
     const std::vector<uint32_t> dims_to_flip = {2, 3};
 
+    std::vector<uint32_t> src_vec(NUMEL, 0);
+    std::vector<uint32_t> result_tt(NUMEL, 0);
+    std::vector<uint32_t> result_cpu(NUMEL, 0);
+
     std::mt19937 gen(69);
     std::uniform_int_distribution<int> dist(0, 10);
-    std::vector<uint32_t> src_vec(numel, 0);
-    std::vector<uint32_t> result_tt(numel, 0);
-    std::vector<uint32_t> result_cpu(numel, 0);
     for (auto& v : src_vec) v = dist(gen);
 
     tensor_flip_cpu(src_vec, result_cpu, input_shape, dims_to_flip);
 
-    // tt part
+    // ------------------------------------------------------------------------
+    // TT part
+    // ------------------------------------------------------------------------
     constexpr int device_id = 0;
     IDevice* device = CreateDevice(device_id);
     Program program = CreateProgram();
@@ -199,9 +236,8 @@ int main(int argc, char** argv) {
     fmt::print("input_tile_strides: {}\n", input_tile_strides);
 
     // Configure Circular Buffers
-    constexpr uint32_t tile_size = sizeof(uint32_t) * TILE_HW;
     const auto cb_data_format = tt::DataFormat::UInt32;
-    uint32_t cb_size = 2 * tile_size; // double buffering
+    uint32_t cb_size = 2 * TILE_SIZE; // double buffering
 
     auto cb_inp = CreateCircularBuffer(
         program,
@@ -210,7 +246,7 @@ int main(int argc, char** argv) {
             .set_page_size(CBIndex::c_0, tile_size));
 
     // ------------------------------------------------------------------------
-    // Setup compile-time arguments and create kernels
+    // 2) Set compile-time arguments and create kernels
     // ------------------------------------------------------------------------
     std::vector<uint32_t> reader_compile_time_args = {
         (uint32_t)input_tensor.buffer()->is_dram(),
@@ -229,50 +265,24 @@ int main(int argc, char** argv) {
         ReaderDataMovementConfig(reader_compile_time_args)
     );
 
-    std::vector<uint32_t> writer_ct_args = {(uint32_t)output_tensor.buffer()->is_dram()};
+    std::vector<uint32_t> writer_compile_time_args = {(uint32_t)output_tensor.buffer()->is_dram()};
     auto writer_id = CreateKernel(
         program,
         OVERRIDE_KERNEL_PREFIX "tensor_flip/kernels/writer_kernel.cpp",
         all_cores,
-        WriterDataMovementConfig(writer_ct_args)
+        WriterDataMovementConfig(writer_compile_time_args)
     );
 
     auto work_groups = {
         std::make_pair(core_group_1, num_tiles_per_core_group_1),
         std::make_pair(core_group_2, num_tiles_per_core_group_2)};
 
-    for (uint32_t src_tile_id = 0; src_tile_id < num_tiles; ++src_tile_id) {
-        size_t remaining = src_tile_id;
+    // calc_src_tile_index()
 
-        std::vector<uint32_t> src_multi_dim(rank, 0);
-        std::vector<uint32_t> dst_multi_dim(rank, 0);
 
-        for (uint32_t i = 0; i < rank; ++i) {
-            size_t dim = rank - i;
-            src_multi_dim[dim] = remaining % input_tile_shape[i];
-
-            bool should_flip = std::find(dims_to_flip.begin(), dims_to_flip.end(), dim) != dims_to_flip.end();
-            if (should_flip) {
-                // calculate dst tile multi dimension coordinate
-                dst_multi_dim[dim] = input_tile_shape[dim] - src_multi_dim[dim] - 1;
-            } else {
-                dst_multi_dim[dim] = src_multi_dim[dim];
-            }
-
-            remaining /= input_tile_shape[i];
-        }
-
-        // dst tile multi dimension coordinate -> dst_linear_tile_id
-        uint32_t dst_tile_id = 0;
-        for (uint32_t j = 0; j < rank; ++j) {
-            dst_tile_id += dst_multi_dim[j] * input_tile_strides[j];
-        }
-
-        fmt::print("src_tile_id: {}, dst_tile_id: {}, src_multi_dim: {}, dst_multi_dim: {}\n",
-            src_tile_id, dst_tile_id, src_multi_dim, dst_multi_dim);
-    }
-
-    // Split the work to all available cores
+    // ------------------------------------------------------------------------
+    // 4) Split work to all available cores
+    // ------------------------------------------------------------------------
     auto core_grid = device->compute_with_storage_grid_size();
     auto [num_cores,
         all_cores,
@@ -289,15 +299,16 @@ int main(int argc, char** argv) {
     fmt::print("num_tiles_per_core_group_1: {}\n", num_tiles_per_core_group_1);
     fmt::print("num_tiles_per_core_group_2: {}\n", num_tiles_per_core_group_2);
 
-    // Set Runtime Arguments for Kernels
+    // ------------------------------------------------------------------------
+    // 5) Set Runtime Arguments for Kernels
+    // ------------------------------------------------------------------------
     std::vector<uint32_t> reader_runtime_args = {input_tensor.buffer()->address(), 0, 0};
     std::vector<uint32_t> writer_runtime_args = {output_tensor.buffer()->address(), 0, 0};
 
-    // reader_rt_args.insert(
-    //     reader_runtime_args.end(),
-    //     input_tile_strides.begin(),
-    //     input_tile_strides.end()
-    // );
+    reader_runtime_args.insert(
+        reader_runtime_args.end(), input_tile_shape.begin(), input_tile_shape.end());
+    reader_runtime_args.insert(
+        reader_runtime_args.end(), input_tile_strides.begin(), input_tile_strides.end());
 
     uint32_t start_tile = 0;
     uint32_t end_tile = 0;
@@ -308,11 +319,11 @@ int main(int argc, char** argv) {
 
                 reader_runtime_args[1] = start_tile;
                 reader_runtime_args[2] = end_tile;
-                SetRuntimeArgs(program, reader_id, core, reader_rt_args);
+                SetRuntimeArgs(program, reader_id, core, reader_runtime_args);
 
                 writer_runtime_args[1] = start_tile;
                 writer_runtime_args[2] = end_tile;
-                SetRuntimeArgs(program, writer_id, core, writer_rt_args);
+                SetRuntimeArgs(program, writer_id, core, writer_runtime_args);
 
                 start_tile += tiles_per_core;
             }
@@ -321,6 +332,7 @@ int main(int argc, char** argv) {
 
     fmt::print("all_close: {}\n", ttnn::allclose<uint32_t>(input_tensor.cpu(), output_tensor.cpu(), 1e-5f, 1e-5f));
     fmt::print("enqueue program\n");
+
     EnqueueProgram(cq, program, false);
     Finish(cq);
 
