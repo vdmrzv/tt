@@ -70,7 +70,9 @@ void kernel_main() {
     // ------------------------------------------------------------------------
     constexpr uint32_t FACE_HW = FACE_HEIGHT * FACE_WIDTH;
     constexpr uint32_t FACE_HW_BYTES = FACE_HW * element_size;
+    constexpr uint32_t NUM_FACES_H = TILE_HEIGHT / FACE_HEIGHT;
     constexpr uint32_t NUM_FACES_W = TILE_WIDTH / FACE_WIDTH;
+    constexpr uint32_t NUM_FACES = NUM_FACES_H * NUM_FACES_W;
     constexpr uint32_t SUBTILE_LINE_BYTES = FACE_WIDTH * element_size;
     constexpr uint32_t FACE_H_STRIDE_BYTES = NUM_FACES_W * FACE_HW_BYTES;
 
@@ -89,19 +91,22 @@ void kernel_main() {
     for (uint32_t tile_id = start_tile; tile_id < end_tile; ++tile_id) {
         cb_reserve_back(cb_id, onetile);
         uint32_t l1_buf_addr = get_write_ptr(cb_id);
-        uint32_t l1_buf_base_addr = l1_buf_addr; // save base address for later debug print
+        uint32_t l1_buf_base_addr = l1_buf_addr; // save base address for debug print
         uint64_t tile_base_addr = get_noc_addr(tile_id, s0, 0);
 
-        for (uint32_t face = 0; face < 4; face++) {
+        // read faces in reverse order
+        for (int32_t face = NUM_FACES - 1; face >= 0; face--) {
             uint64_t face_addr = tile_base_addr + face * FACE_HW_BYTES;
+
+            // read rows in reverse order
             for (int32_t face_row = FACE_HEIGHT - 1; face_row >= 0; face_row--) {
                 uint64_t face_row_addr = face_addr + face_row * SUBTILE_LINE_BYTES;
                 noc_async_read(face_row_addr, l1_buf_addr, SUBTILE_LINE_BYTES);
                 noc_async_read_barrier();
 
-                for (uint32_t face_col = 0; face_col < FACE_WIDTH; ++face_col) {
-                    DPRINT << uint32_t(reinterpret_cast<uint32_t*>(l1_buf_addr)[face_col]) << ", ";
-                }
+                // for (uint32_t face_col = 0; face_col < FACE_WIDTH; ++face_col) {
+                //     DPRINT << uint32_t(reinterpret_cast<uint32_t*>(l1_buf_addr)[face_col]) << ", ";
+                // }
 
                 // Flip elements within the row in L1
                 uint32_t* row_data = reinterpret_cast<uint32_t*>(l1_buf_addr);
@@ -111,9 +116,9 @@ void kernel_main() {
                     row_data[FACE_WIDTH - 1 - i] = temp;
                 }
                 l1_buf_addr += SUBTILE_LINE_BYTES;
-                DPRINT << ENDL();
+                // DPRINT << ENDL();
             }
-            DPRINT << ENDL();
+            // DPRINT << ENDL();
         }
 
         DPRINT << "debug print" << ENDL();
