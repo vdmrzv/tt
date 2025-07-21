@@ -38,7 +38,7 @@ inline uint32_t calc_src_tile_index(
         dst_tile_id += dst_multi_dim[j] * input_tile_strides[j];
     }
     return dst_tile_id;
-}  
+}
 
 void kernel_main() {
     // ------------------------------------------------------------------------
@@ -84,24 +84,49 @@ void kernel_main() {
         .data_format = data_format
     };
 
+    DPRINT << start_tile << "-" << end_tile << ENDL();
+
     for (uint32_t tile_id = start_tile; tile_id < end_tile; ++tile_id) {
         cb_reserve_back(cb_id, onetile);
         uint32_t l1_buf_addr = get_write_ptr(cb_id);
-        uint64_t face_base_addr = get_noc_addr(tile_id, s0, 0);
+        uint32_t l1_buf_base_addr = l1_buf_addr; // save base address for later debug print
+        uint64_t tile_base_addr = get_noc_addr(tile_id, s0, 0);
 
-        uint64_t face_offset = 0;
         for (uint32_t face = 0; face < 4; face++) {
-            uint64_t row_offset = 0;
-            for (uint32_t face_row = 0; face_row < FACE_HEIGHT; face_row++) {
-                noc_async_read(face_base_addr + face_offset + row_offset, l1_buf_addr, SUBTILE_LINE_BYTES);
+            uint64_t face_addr = tile_base_addr + face * FACE_HW_BYTES;
+            for (int32_t face_row = FACE_HEIGHT - 1; face_row >= 0; face_row--) {
+                uint64_t face_row_addr = face_addr + face_row * SUBTILE_LINE_BYTES;
+                noc_async_read(face_row_addr, l1_buf_addr, SUBTILE_LINE_BYTES);
+                noc_async_read_barrier();
+
                 for (uint32_t face_col = 0; face_col < FACE_WIDTH; ++face_col) {
                     DPRINT << uint32_t(reinterpret_cast<uint32_t*>(l1_buf_addr)[face_col]) << ", ";
                 }
-                DPRINT << ENDL();
+
+                // Flip elements within the row in L1
+                uint32_t* row_data = reinterpret_cast<uint32_t*>(l1_buf_addr);
+                for (uint32_t i = 0; i < FACE_WIDTH / 2; ++i) {
+                    uint32_t temp = row_data[i];
+                    row_data[i] = row_data[FACE_WIDTH - 1 - i];
+                    row_data[FACE_WIDTH - 1 - i] = temp;
+                }
                 l1_buf_addr += SUBTILE_LINE_BYTES;
-                row_offset += SUBTILE_LINE_BYTES;
+                DPRINT << ENDL();
             }
-            face_offset += FACE_HEIGHT * SUBTILE_LINE_BYTES;
+            DPRINT << ENDL();
+        }
+
+        DPRINT << "debug print" << ENDL();
+
+        // debug print
+        for (uint32_t face = 0; face < 4; face++) {
+            for (uint32_t face_row = 0; face_row < FACE_HEIGHT; face_row++) {
+                for (uint32_t face_col = 0; face_col < FACE_WIDTH; ++face_col) {
+                    DPRINT << uint32_t(reinterpret_cast<uint32_t*>(l1_buf_base_addr)[face_col]) << ", ";
+                }
+                l1_buf_base_addr += SUBTILE_LINE_BYTES;
+                DPRINT << ENDL();
+            }
             DPRINT << ENDL();
         }
         cb_push_back(cb_id, onetile);

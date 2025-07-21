@@ -13,6 +13,7 @@
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/tilize_utils.hpp>
 #include <tt-metalium/work_split.hpp>
+#include <tt-metalium/tilize_utils.hpp>
 
 #include "ttnn/tensor/tensor.hpp"
 #include "ttnn/tensor/types.hpp"
@@ -119,7 +120,7 @@ static std::vector<uint32_t> compute_strides(const std::vector<uint32_t>& shape)
 
 // Pretty print a tensor stored as a flat vector
 template <typename T>
-void pprint(std::vector<T>& tensor, std::vector<uint32_t> dims) {
+void pprint(const std::vector<T>& tensor, const std::vector<uint32_t>& dims) {
     size_t ndim = dims.size();
     size_t total_elems = tensor.size();
 
@@ -185,9 +186,15 @@ void tensor_flip_cpu(
 
 int main(int argc, char** argv) {
     constexpr uint32_t N = 1;
+
     constexpr uint32_t C = 2;
     constexpr uint32_t H = 128;
     constexpr uint32_t W = 224;
+
+    // constexpr uint32_t C = 1;
+    // constexpr uint32_t H = 32;
+    // constexpr uint32_t W = 32;
+
     constexpr uint32_t NUMEL = N * C * H * W;
     constexpr uint32_t ELEMENT_SIZE = sizeof(uint32_t);
     constexpr uint32_t TILE_SIZE = ELEMENT_SIZE * TILE_HW;
@@ -202,9 +209,15 @@ int main(int argc, char** argv) {
     std::mt19937 gen(69);
     std::uniform_int_distribution<int> dist(0, 9);
     for (auto& v : src_vec) v = dist(gen);
-    pprint(src_vec, {1, 32, 32});
 
     tensor_flip_cpu(src_vec, result_cpu, input_shape, dims_to_flip);
+
+    // fmt::print("src_vec:\n");
+    // pprint(src_vec, {1, 1, 32, 32});
+
+    src_vec = tilize_nfaces(src_vec, N * C * H, W);
+    // fmt::print("src_vec tilized:\n");
+    // pprint(src_vec, {1, 1, 32, 32});
 
     // ------------------------------------------------------------------------
     // TT part
@@ -223,17 +236,21 @@ int main(int argc, char** argv) {
     ttnn::Tensor output_tensor = ttnn::Tensor::from_vector(result_tt, tensor_spec);
     output_tensor = output_tensor.to_device(device);
 
-    ttnn::Tensor sliced_input_tensor = ttnn::slice(
-                ttnn::DefaultQueueId,
-                input_tensor,
-                ttnn::SmallVector<uint32_t>{0, 0, 0, 0},  // Start
-                ttnn::SmallVector<uint32_t>{1, 1, 32, 32}, // End
-                ttnn::SmallVector<uint32_t>{1, 1, 1, 1}); // Step
-    // std::string tensor_str = sliced_input_tensor.write_to_string();  
-    // fmt::print("sliced_input_tensor: ", tensor_str);
+    // fmt::print("input_tensor\n");
+    // input_tensor.print();
+    // pprint(std::vector<uint32_t>(input_tensor.to_vector<uint32_t>()), input_shape);
 
-    std::vector<uint32_t> values = sliced_input_tensor.to_vector<uint32_t>();
-    pprint(values, {1, 32, 32});
+    // ttnn::Tensor sliced_input_tensor = ttnn::slice(
+    //     ttnn::DefaultQueueId,
+    //     input_tensor,
+    //     ttnn::SmallVector<uint32_t>{0, 0, 0, 32}, // Start
+    //     ttnn::SmallVector<uint32_t>{1, 1, 32, 64}, // End
+    //     ttnn::SmallVector<uint32_t>{1, 1, 1, 1}); // Step
+    // Synchronize(device);
+
+    // fmt::print("sliced_input_tensor\n");
+    // sliced_input_tensor.print();
+    // pprint(std::vector<uint32_t>(sliced_input_tensor.to_vector<uint32_t>()), {1, 1, 32, 32});
 
     uint32_t rank = input_tensor.logical_shape().rank();
     uint32_t num_tiles = get_num_tiles(input_tensor);
@@ -250,6 +267,8 @@ int main(int argc, char** argv) {
     // 4) Split work to all available cores
     // ------------------------------------------------------------------------
     auto core_grid = device->compute_with_storage_grid_size();
+    CoreRangeSet custom_core_range = CoreRangeSet(CoreRange({0, 0}, {3, 6})); // 4x7 = 28 cores  
+
     auto [num_cores,
         all_cores,
         core_group_1,
@@ -340,14 +359,14 @@ int main(int argc, char** argv) {
         }
     }
 
-    fmt::print("all_close: {}\n", ttnn::allclose<uint32_t>(input_tensor.cpu(), output_tensor.cpu(), 1e-5f, 1e-5f));
-    fmt::print("enqueue program\n");
+    // fmt::print("all_close: {}\n", ttnn::allclose<uint32_t>(input_tensor.cpu(), output_tensor.cpu(), 1e-5f, 1e-5f));
+    // fmt::print("enqueue program\n");
 
     EnqueueProgram(cq, program, false);
     Finish(cq);
 
-    fmt::print("finished execution\n");
-    fmt::print("all_close: {}\n", ttnn::allclose<uint32_t>(input_tensor.cpu(), output_tensor.cpu(), 1e-5f, 1e-5f));
+    // fmt::print("finished execution\n");
+    // fmt::print("all_close: {}\n", ttnn::allclose<uint32_t>(input_tensor.cpu(), output_tensor.cpu(), 1e-5f, 1e-5f));
 
     CloseDevice(device);
     return 0;
