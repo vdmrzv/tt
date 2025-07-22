@@ -106,12 +106,9 @@ void kernel_main() {
 
         uint64_t tile_base_addr = get_noc_addr(src_tile_id, s0, 0);
 
-        // order of reading faces should be:
-        // if (is_horizontal_flip): 1, 0, 3, 2
-        // if (is_vertical_flip): 2, 3, 0, 1
-        // if (is_horizontal_flip and is_vertical_flip): 3, 2, 1, 0
+        // face reading order depends on type of flip we performing
         static const uint32_t order_array[4][NUM_FACES] = {
-            {0, 1, 2, 3}, // No flip
+            {0, 1, 2, 3}, // If both flip flags FALSE then no intra tile flipping is needed
             {1, 0, 3, 2}, // Horizontal flip
             {2, 3, 0, 1}, // Vertical flip
             {3, 2, 1, 0}  // Both flips
