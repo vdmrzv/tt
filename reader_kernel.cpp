@@ -19,7 +19,6 @@ inline uint32_t calc_src_tile_index(
         remaining /= tiled_shape[dim];
     }
 
-
     // 2. Based on 1) compute multi-dimensional index for the source tile
     for (uint32_t i = 0; i < rank; ++i) {
         if (dims_to_flip[i]) {
@@ -83,8 +82,8 @@ void kernel_main() {
     constexpr uint32_t NUM_FACES_W = TILE_WIDTH / FACE_WIDTH;
     constexpr uint32_t NUM_FACES = NUM_FACES_H * NUM_FACES_W;
     constexpr uint32_t SUBTILE_LINE_BYTES = FACE_WIDTH * element_size;
-    constexpr bool is_vertical_flip = dims_to_flip[rank - 2];
-    constexpr bool is_horizontal_flip = dims_to_flip[rank - 1];
+    const bool is_vertical_flip = static_cast<bool>(dims_to_flip[RANK - 2]);
+    const bool is_horizontal_flip = static_cast<bool>(dims_to_flip[RANK - 1]);
 
     constexpr uint32_t onetile = 1;
     constexpr uint32_t cb_id = tt::CBIndex::c_0;
@@ -100,22 +99,35 @@ void kernel_main() {
         cb_reserve_back(cb_id, onetile);
         uint32_t l1_buf_addr = get_write_ptr(cb_id);
         uint32_t save_addr = l1_buf_addr; // save base address for debug print
+
         uint32_t src_tile_id = calc_src_tile_index(
             tile_id, RANK, dims_to_flip, tiled_shape, tile_strides);
         // DPRINT << tile_id << " <- " << src_tile_id << ENDL();
+
         uint64_t tile_base_addr = get_noc_addr(src_tile_id, s0, 0);
 
-        // read faces in reverse order
-        for (int32_t face = NUM_FACES - 1; face >= 0; face--) {
-            uint64_t face_addr = tile_base_addr + face * FACE_HW_BYTES;
+        // order of reading faces should be:
+        // if (is_horizontal_flip): 1, 0, 3, 2
+        // if (is_vertical_flip): 2, 3, 0, 1
+        // if (is_horizontal_flip and is_vertical_flip): 3, 2, 1, 0
+        static const uint32_t order_array[4][NUM_FACES] = {
+            {0, 1, 2, 3}, // No flip
+            {1, 0, 3, 2}, // Horizontal flip
+            {2, 3, 0, 1}, // Vertical flip
+            {3, 2, 1, 0}  // Both flips
+        };
 
-            // for (int32_t face_row = FACE_HEIGHT - 1; face_row >= 0; face_row--) {
-            // for (int32_t face_row = 0; face_row < FACE_HEIGHT; face_row++) {
+        // Select the appropriate face order based on flip flags
+        uint32_t order_index = (is_horizontal_flip ? 1 : 0) + (is_vertical_flip ? 2 : 0);
+        const uint32_t *face_reading_order = order_array[order_index];
+
+        for (uint32_t i = 0; i < NUM_FACES; i++) {
+            uint64_t face_addr = tile_base_addr + face_reading_order[i] * FACE_HW_BYTES;
 
             // if vertical flip read rows in reverse order else read in normal order
-            int32_t step = flip ? -1 : 1;
-            int32_t start = flip ? FACE_HEIGHT - 1 : 0;
-            int32_t end = flip ? -1 : FACE_HEIGHT;
+            int32_t step = is_vertical_flip ? -1 : 1;
+            int32_t start = is_vertical_flip ? FACE_HEIGHT - 1 : 0;
+            int32_t end = is_vertical_flip ? -1 : FACE_HEIGHT;
             for (int32_t face_row = start; face_row != end; face_row += step) {
                 uint64_t face_row_addr = face_addr + face_row * SUBTILE_LINE_BYTES;
                 // TODO instead of reading line by line, read the whole tile
