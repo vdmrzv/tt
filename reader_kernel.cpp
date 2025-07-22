@@ -1,43 +1,58 @@
 #include "dataflow_api.h"
 #include "debug/dprint.h"
 
-
 inline uint32_t calc_src_tile_index(
-    uint32_t src_tile_id,
+    uint32_t dst_tile_id,
     uint32_t rank,
     uint32_t* dims_to_flip,
-    uint32_t* input_tile_shape,
-    uint32_t* input_tile_strides) {
+    uint32_t* tiled_shape,
+    uint32_t* tile_strides) {
 
-    // 1. Compute multi-dimensional index for the source tile
-    // 2. Convert multi-dimensional index to linear index
-
-    size_t remaining = src_tile_id;
+    size_t remaining = dst_tile_id;
     uint32_t src_multi_dim[rank];
     uint32_t dst_multi_dim[rank];
+    uint32_t num_dims_to_flip = 2; // TODO fix this
 
+    // 1. Convert output tile linear index to multi-dimensional index
+    for (uint32_t i = 0; i < rank; ++i) {  
+        uint32_t dim = rank - 1 - i;
+        dst_multi_dim[dim] = remaining % tiled_shape[dim];
+        remaining /= tiled_shape[dim];
+    }
+
+    // 2. Based on 1) compute multi-dimensional index for the source tile
     for (uint32_t i = 0; i < rank; ++i) {
-        size_t dim = rank - i;
-        src_multi_dim[dim] = remaining % input_tile_shape[i];
+        bool should_flip = false;
+        for (uint32_t j = 0; j < num_dims_to_flip; j++) {
+            if (dims_to_flip[j] == i) {
+                should_flip = true;
+                break;
+            }
+        }
 
-        // bool should_flip = std::find(
-        //     dims_to_flip.begin(), dims_to_flip.end(), dim) != dims_to_flip.end();
-        // if (should_flip) {
-        //     // calculate dst tile multi dimension coordinate
-        //     dst_multi_dim[dim] = input_tile_shape[dim] - src_multi_dim[dim] - 1;
-        // } else {
-        //     dst_multi_dim[dim] = src_multi_dim[dim];
-        // }
-
-        remaining /= input_tile_shape[i];
+        if (should_flip) {
+            src_multi_dim[i] = tiled_shape[i] - dst_multi_dim[i] - 1;
+        } else {
+            src_multi_dim[i] = dst_multi_dim[i];
+        }
     }
 
-    // dst tile multi dimension coordinate -> dst_linear_tile_id
-    uint32_t dst_tile_id = 0;
-    for (uint32_t j = 0; j < rank; ++j) {
-        dst_tile_id += dst_multi_dim[j] * input_tile_strides[j];
+    // DPRINT << "DST_MULTI_DIM: ";
+    // for (uint32_t i = 0; i < rank; ++i)
+    //     DPRINT << dst_multi_dim[i] << ", ";
+    // DPRINT << ENDL();
+
+    // DPRINT << "SRC_MULTI_DIM: ";
+    // for (uint32_t i = 0; i < rank; ++i)
+    //     DPRINT << src_multi_dim[i] << ", ";
+    // DPRINT << ENDL();
+
+    // 3. Convert source tile multi-dimensional index to linear index
+    uint32_t src_tile_id = 0;
+    for (uint32_t i = 0; i < rank; ++i) {
+        src_tile_id += src_multi_dim[i] * tile_strides[i];
     }
-    return dst_tile_id;
+    return src_tile_id;
 }
 
 void kernel_main() {
@@ -59,10 +74,10 @@ void kernel_main() {
     const uint32_t start_tile = get_arg_val<uint32_t>(1);
     const uint32_t end_tile  = get_arg_val<uint32_t>(2);
 
-    uint32_t input_tile_shape[RANK], input_tile_strides[RANK];
+    uint32_t tiled_shape[RANK], tile_strides[RANK];
     for (uint32_t i = 0; i < RANK; i++) {
-        input_tile_shape[i] = get_arg_val<uint32_t>(i + 3);
-        input_tile_strides[i] = get_arg_val<uint32_t>(i + RANK + 3);
+        tiled_shape[i] = get_arg_val<uint32_t>(i + 3);
+        tile_strides[i] = get_arg_val<uint32_t>(i + RANK + 3);
     }
 
     // ------------------------------------------------------------------------
@@ -86,13 +101,18 @@ void kernel_main() {
         .data_format = data_format
     };
 
-    DPRINT << start_tile << "-" << end_tile << ENDL();
+    uint32_t dims_to_flip[2] = {2, 3}; // TODO fix this
 
     for (uint32_t tile_id = start_tile; tile_id < end_tile; ++tile_id) {
         cb_reserve_back(cb_id, onetile);
         uint32_t l1_buf_addr = get_write_ptr(cb_id);
         uint32_t l1_buf_base_addr = l1_buf_addr; // save base address for debug print
-        uint64_t tile_base_addr = get_noc_addr(tile_id, s0, 0);
+ 
+        uint32_t src_tile_id = calc_src_tile_index(
+            tile_id, RANK, dims_to_flip, tiled_shape, tile_strides);
+        // DPRINT << tile_id << " <- " << src_tile_id << ENDL();
+ 
+        uint64_t tile_base_addr = get_noc_addr(src_tile_id, s0, 0);
 
         // read faces in reverse order
         for (int32_t face = NUM_FACES - 1; face >= 0; face--) {
@@ -104,10 +124,6 @@ void kernel_main() {
                 noc_async_read(face_row_addr, l1_buf_addr, SUBTILE_LINE_BYTES);
                 noc_async_read_barrier();
 
-                // for (uint32_t face_col = 0; face_col < FACE_WIDTH; ++face_col) {
-                //     DPRINT << uint32_t(reinterpret_cast<uint32_t*>(l1_buf_addr)[face_col]) << ", ";
-                // }
-
                 // Flip elements within the row in L1
                 uint32_t* row_data = reinterpret_cast<uint32_t*>(l1_buf_addr);
                 for (uint32_t i = 0; i < FACE_WIDTH / 2; ++i) {
@@ -116,24 +132,21 @@ void kernel_main() {
                     row_data[FACE_WIDTH - 1 - i] = temp;
                 }
                 l1_buf_addr += SUBTILE_LINE_BYTES;
-                // DPRINT << ENDL();
             }
-            // DPRINT << ENDL();
         }
 
-        DPRINT << "debug print" << ENDL();
-
-        // debug print
-        for (uint32_t face = 0; face < 4; face++) {
-            for (uint32_t face_row = 0; face_row < FACE_HEIGHT; face_row++) {
-                for (uint32_t face_col = 0; face_col < FACE_WIDTH; ++face_col) {
-                    DPRINT << uint32_t(reinterpret_cast<uint32_t*>(l1_buf_base_addr)[face_col]) << ", ";
-                }
-                l1_buf_base_addr += SUBTILE_LINE_BYTES;
-                DPRINT << ENDL();
-            }
-            DPRINT << ENDL();
-        }
+        // DPRINT << "debug print" << ENDL();
+        // for (uint32_t face = 0; face < 4; face++) {
+        //     for (uint32_t face_row = 0; face_row < FACE_HEIGHT; face_row++) {
+        //         for (uint32_t face_col = 0; face_col < FACE_WIDTH; ++face_col) {
+        //             DPRINT << uint32_t(reinterpret_cast<uint32_t*>(l1_buf_base_addr)[face_col]) << ", ";
+        //         }
+        //         l1_buf_base_addr += SUBTILE_LINE_BYTES;
+        //         DPRINT << ENDL();
+        //     }
+        //     DPRINT << ENDL();
+        // }
+        noc_async_read_barrier();
         cb_push_back(cb_id, onetile);
     }
 }

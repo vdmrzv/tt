@@ -187,13 +187,13 @@ void tensor_flip_cpu(
 int main(int argc, char** argv) {
     constexpr uint32_t N = 1;
 
-    constexpr uint32_t C = 2;
-    constexpr uint32_t H = 128;
-    constexpr uint32_t W = 224;
+    // constexpr uint32_t C = 2;
+    // constexpr uint32_t H = 128;
+    // constexpr uint32_t W = 224;
 
-    // constexpr uint32_t C = 1;
-    // constexpr uint32_t H = 32;
-    // constexpr uint32_t W = 32;
+    constexpr uint32_t C = 1;
+    constexpr uint32_t H = 64;
+    constexpr uint32_t W = 64;
 
     constexpr uint32_t NUMEL = N * C * H * W;
     constexpr uint32_t ELEMENT_SIZE = sizeof(uint32_t);
@@ -235,7 +235,7 @@ int main(int argc, char** argv) {
     input_tensor = input_tensor.to_device(device);
     ttnn::Tensor output_tensor = ttnn::Tensor::from_vector(result_tt, tensor_spec);
     output_tensor = output_tensor.to_device(device);
-
+    
     // fmt::print("input_tensor\n");
     // input_tensor.print();
     // pprint(std::vector<uint32_t>(input_tensor.to_vector<uint32_t>()), input_shape);
@@ -256,11 +256,11 @@ int main(int argc, char** argv) {
     uint32_t num_tiles = get_num_tiles(input_tensor);
     const auto& tile_shape = input_tensor.tensor_spec().tile().get_tile_shape();
     const auto& face_shape = input_tensor.tensor_spec().tile().get_face_shape();
-    ttnn::SmallVector<uint32_t> input_tile_shape = get_tiled_shape(input_tensor);
-    ttnn::SmallVector<uint32_t> input_tile_strides = get_tile_strides(input_tile_shape);
+    ttnn::SmallVector<uint32_t> input_tiled_shape = get_tiled_shape(input_tensor);
+    ttnn::SmallVector<uint32_t> input_tile_strides = get_tile_strides(input_tiled_shape);
 
     fmt::print("input_shape: {}\n", input_shape);
-    fmt::print("input_tile_shape: {}\n", input_tile_shape);
+    fmt::print("input_tiled_shape: {}\n", input_tiled_shape);
     fmt::print("input_tile_strides: {}\n", input_tile_strides);
 
     // ------------------------------------------------------------------------
@@ -274,7 +274,7 @@ int main(int argc, char** argv) {
         core_group_1,
         core_group_2,
         num_tiles_per_core_group_1,
-        num_tiles_per_core_group_2] = split_work_to_cores(core_grid, num_tiles);
+        num_tiles_per_core_group_2] = split_work_to_cores(custom_core_range, num_tiles);
 
     fmt::print("core_grid: {}\n", core_grid);
     fmt::print("num_cores: {}\n", num_cores);
@@ -335,7 +335,7 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> writer_runtime_args = {output_tensor.buffer()->address(), 0, 0};
 
     reader_runtime_args.insert(
-        reader_runtime_args.end(), input_tile_shape.begin(), input_tile_shape.end());
+        reader_runtime_args.end(), input_tiled_shape.begin(), input_tiled_shape.end());
     reader_runtime_args.insert(
         reader_runtime_args.end(), input_tile_strides.begin(), input_tile_strides.end());
 
@@ -359,15 +359,20 @@ int main(int argc, char** argv) {
         }
     }
 
-    // fmt::print("all_close: {}\n", ttnn::allclose<uint32_t>(input_tensor.cpu(), output_tensor.cpu(), 1e-5f, 1e-5f));
+    // fmt::print("all_close: {}\n", ttnn::allclose<uint32_t>(
+    //     ttnn::Tensor::from_vector(result_cpu, tensor_spec), output_tensor.cpu(), 1e-5f, 1e-5f));
     // fmt::print("enqueue program\n");
+    pprint(std::vector<uint32_t>(input_tensor.to_vector<uint32_t>()), input_shape);
+    fmt::print("=====================================================================\n");
 
     EnqueueProgram(cq, program, false);
     Finish(cq);
 
     // fmt::print("finished execution\n");
-    // fmt::print("all_close: {}\n", ttnn::allclose<uint32_t>(input_tensor.cpu(), output_tensor.cpu(), 1e-5f, 1e-5f));
+    // fmt::print("all_close: {}\n", ttnn::allclose<uint32_t>(
+    //     ttnn::Tensor::from_vector(result_cpu, tensor_spec), output_tensor.cpu(), 1e-5f, 1e-5f));
 
+    pprint(std::vector<uint32_t>(output_tensor.to_vector<uint32_t>()), input_shape);
     CloseDevice(device);
     return 0;
 }
