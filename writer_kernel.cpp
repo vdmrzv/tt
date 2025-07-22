@@ -3,15 +3,15 @@
 void kernel_main() {
     // compile time args
     constexpr bool dst_is_dram = get_compile_time_arg_val(0) == 1;
-    uint32_t tile_size = get_compile_time_arg_val(1);
 
     // runtime args
     uint32_t dst_addr = get_arg_val<uint32_t>(0);
-    uint32_t start_tile = get_arg_val<uint32_t>(2);
-    uint32_t end_tile  = get_arg_val<uint32_t>(3);
+    uint32_t start_tile = get_arg_val<uint32_t>(1);
+    uint32_t end_tile  = get_arg_val<uint32_t>(2);
 
     constexpr uint32_t cb_id = tt::CBIndex::c_0;
     const DataFormat data_format = get_dataformat(cb_id);
+    const uint32_t tile_size = get_tile_size(cb_id);
 
     const InterleavedAddrGenFast<dst_is_dram> d0 = {
         .bank_base_address = dst_addr,
