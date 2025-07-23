@@ -2,12 +2,7 @@
 #include "debug/dprint.h"
 
 inline uint32_t calc_src_tile_index(
-    uint32_t dst_tile_id,
-    uint32_t rank,
-    uint32_t* dims_to_flip,
-    uint32_t* tiled_shape,
-    uint32_t* tile_strides) {
-
+    uint32_t dst_tile_id, uint32_t rank, uint32_t* dims_to_flip, uint32_t* tiled_shape, uint32_t* tile_strides) {
     size_t remaining = dst_tile_id;
     uint32_t src_multi_dim[rank];
     uint32_t dst_multi_dim[rank];
@@ -58,13 +53,12 @@ void kernel_main() {
     constexpr uint32_t FACE_HEIGHT = get_compile_time_arg_val(5);
     constexpr uint32_t FACE_WIDTH = get_compile_time_arg_val(6);
 
-
     // ------------------------------------------------------------------------
     // 2) Runtime arguments
     // ------------------------------------------------------------------------
     const uint32_t src_addr = get_arg_val<uint32_t>(0);
     const uint32_t start_tile = get_arg_val<uint32_t>(1);
-    const uint32_t end_tile  = get_arg_val<uint32_t>(2);
+    const uint32_t end_tile = get_arg_val<uint32_t>(2);
 
     uint32_t tiled_shape[RANK], tile_strides[RANK], dims_to_flip[RANK];
     for (uint32_t i = 0; i < RANK; i++) {
@@ -90,33 +84,29 @@ void kernel_main() {
     const DataFormat data_format = get_dataformat(cb_id);
     const uint32_t tile_size = get_tile_size(cb_id);
     const InterleavedAddrGenFast<src_is_dram> s0 = {
-        .bank_base_address = src_addr,
-        .page_size = tile_size,
-        .data_format = data_format
-    };
+        .bank_base_address = src_addr, .page_size = tile_size, .data_format = data_format};
 
     for (uint32_t tile_id = start_tile; tile_id < end_tile; ++tile_id) {
         cb_reserve_back(cb_id, onetile);
         uint32_t l1_buf_addr = get_write_ptr(cb_id);
-        uint32_t save_addr = l1_buf_addr; // save base address for debug print
+        uint32_t save_addr = l1_buf_addr;  // save base address for debug print
 
-        uint32_t src_tile_id = calc_src_tile_index(
-            tile_id, RANK, dims_to_flip, tiled_shape, tile_strides);
+        uint32_t src_tile_id = calc_src_tile_index(tile_id, RANK, dims_to_flip, tiled_shape, tile_strides);
         // DPRINT << tile_id << " <- " << src_tile_id << ENDL();
 
         uint64_t tile_base_addr = get_noc_addr(src_tile_id, s0, 0);
 
         // face reading order depends on type of flip we performing
         static const uint32_t order_array[4][NUM_FACES] = {
-            {0, 1, 2, 3}, // If both flip flags FALSE then no intra tile flipping is needed
-            {1, 0, 3, 2}, // Horizontal flip
-            {2, 3, 0, 1}, // Vertical flip
-            {3, 2, 1, 0}  // Both flips
+            {0, 1, 2, 3},  // If both flip flags FALSE then no intra tile flipping is needed
+            {1, 0, 3, 2},  // Horizontal flip
+            {2, 3, 0, 1},  // Vertical flip
+            {3, 2, 1, 0}   // Both flips
         };
 
         // Select the appropriate face order based on flip flags
         uint32_t order_index = (is_horizontal_flip ? 1 : 0) + (is_vertical_flip ? 2 : 0);
-        const uint32_t *face_reading_order = order_array[order_index];
+        const uint32_t* face_reading_order = order_array[order_index];
 
         for (uint32_t i = 0; i < NUM_FACES; i++) {
             uint64_t face_addr = tile_base_addr + face_reading_order[i] * FACE_HW_BYTES;

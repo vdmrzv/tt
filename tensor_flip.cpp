@@ -33,42 +33,6 @@ using namespace tt;
 using namespace tt::tt_metal;
 using namespace tt::constants;
 
-// uint32_t calc_src_tile_index(
-//     std::vector<uint32_t>& dims_to_flip
-//     uint32_t src_tile_id,
-//     uint32_t rank
-//     ttnn::Shape& input_tile_shape,
-//     ttnn::SmallVector<uint32_t>& input_tile_strides
-// ) {
-//     size_t remaining = src_tile_id;
-//     std::vector<uint32_t> src_multi_dim(rank, 0);
-//     std::vector<uint32_t> dst_multi_dim(rank, 0);
-
-//     for (uint32_t i = 0; i < rank; ++i) {
-//         size_t dim = rank - i;
-//         src_multi_dim[dim] = remaining % input_tile_shape[i];
-
-//         bool should_flip = std::find(
-//             dims_to_flip.begin(), dims_to_flip.end(), dim) != dims_to_flip.end();
-//         if (should_flip) {
-//             // calculate dst tile multi dimension coordinate
-//             dst_multi_dim[dim] = input_tile_shape[dim] - src_multi_dim[dim] - 1;
-//         } else {
-//             dst_multi_dim[dim] = src_multi_dim[dim];
-//         }
-
-//         remaining /= input_tile_shape[i];
-//     }
-
-//     // dst tile multi dimension coordinate -> dst_linear_tile_id
-//     uint32_t dst_tile_id = 0;
-//     for (uint32_t j = 0; j < rank; ++j) {
-//         dst_tile_id += dst_multi_dim[j] * input_tile_strides[j];
-//     }
-//     return dst_tile_id;
-// }
-
-
 uint32_t tile_volume(const ttnn::Tensor& input_tensor) {
     const auto& tile_shape = input_tensor.tensor_spec().tile().get_tile_shape();
     return tile_shape[0] * tile_shape[1];
@@ -162,7 +126,7 @@ void tensor_flip_cpu(
     const std::vector<uint32_t>& src,
     std::vector<uint32_t>& dst,
     const std::vector<uint32_t>& tensor_shape,
-    const std::vector<uint32_t>& dims_to_flip) 
+    const std::vector<uint32_t>& dims)
 {
     const size_t numel = src.size();
     dst.resize(numel);
@@ -174,8 +138,7 @@ void tensor_flip_cpu(
         for (size_t dim = 0; dim < ndim; ++dim) {
             uint32_t coord = linear / strides[dim];
             linear %= strides[dim];
-            // flip coordinate if needed
-            if (std::find(dims_to_flip.begin(), dims_to_flip.end(), dim) != dims_to_flip.end()) {
+            if (std::find(dims.begin(), dims.end(), dim) != dims.end()) {
                 coord = tensor_shape[dim] - 1 - coord;
             }
             dst_linear += coord * strides[dim];
@@ -200,7 +163,7 @@ int main(int argc, char** argv) {
     constexpr uint32_t TILE_SIZE = ELEMENT_SIZE * TILE_HW;
 
     const std::vector<uint32_t> input_shape = {N, C, H, W};
-    const std::vector<uint32_t> dims_to_flip = {2, 3};
+    const std::vector<uint32_t> dims = {2, 3};
 
     std::vector<uint32_t> src_vec(NUMEL, 0);
     std::vector<uint32_t> result_tt(NUMEL, 0);
@@ -210,7 +173,7 @@ int main(int argc, char** argv) {
     std::uniform_int_distribution<int> dist(0, 9);
     for (auto& v : src_vec) v = dist(gen);
 
-    tensor_flip_cpu(src_vec, result_cpu, input_shape, dims_to_flip);
+    tensor_flip_cpu(src_vec, result_cpu, input_shape, dims);
 
     // fmt::print("src_vec:\n");
     // pprint(src_vec, {1, 1, 32, 32});
@@ -289,7 +252,6 @@ int main(int argc, char** argv) {
     // ------------------------------------------------------------------------
     const auto cb_data_format = tt::DataFormat::UInt32;
     uint32_t cb_size = 2 * TILE_SIZE; // double buffering
-
     auto cb_inp = CreateCircularBuffer(
         program,
         all_cores,
@@ -334,10 +296,15 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> reader_runtime_args = {input_tensor.buffer()->address(), 0, 0};
     std::vector<uint32_t> writer_runtime_args = {output_tensor.buffer()->address(), 0, 0};
 
+    std::vector<uint32_t> dims_to_flip(rank, 0);
+    for (const auto& d : dims) dims_to_flip[d] = 1;
+
     reader_runtime_args.insert(
         reader_runtime_args.end(), input_tiled_shape.begin(), input_tiled_shape.end());
     reader_runtime_args.insert(
         reader_runtime_args.end(), input_tile_strides.begin(), input_tile_strides.end());
+    reader_runtime_args.insert(
+        reader_runtime_args.end(), dims_to_flip.begin(), dims_to_flip.end());
 
     uint32_t start_tile = 0;
     uint32_t end_tile = 0;
