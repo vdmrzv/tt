@@ -8,6 +8,7 @@
 
 #include <fmt/core.h>
 
+#include <tt-metalium/hal.hpp>
 #include <tt-metalium/device.hpp>
 #include <tt-metalium/constants.hpp>
 #include <tt-metalium/host_api.hpp>
@@ -61,6 +62,24 @@ static ttnn::SmallVector<uint32_t> get_tiled_shape(const ttnn::Tensor& input_ten
         tiled_shape.push_back(dim);
     }
     return tiled_shape;
+}
+
+static uint32_t get_page_size(const ttnn::Tensor& input_tensor) {
+    auto BUFFER_ALIGNMENT = input_tensor.buffer()->buffer_type() == tt::tt_metal::BufferType::DRAM
+                                ? tt::tt_metal::hal::get_dram_alignment()
+                                : tt::tt_metal::hal::get_l1_alignment();
+    const auto& shape = input_tensor.logical_shape();  // in anticipation of RM padding
+    return tt::round_up(shape[-1] * input_tensor.element_size(), BUFFER_ALIGNMENT);
+}
+
+static std::vector<uint32_t> get_row_strides(const ttnn::Shape& shape) {
+    std::vector<uint32_t> strides(shape.rank());
+    strides[shape.rank() - 1] = 1;
+    strides[shape.rank() - 2] = 1;
+    for (int i = shape.rank() - 3; i >= 0; i--) {
+        strides[i] = strides[i + 1] * shape[i + 1];
+    }
+    return strides;
 }
 
 static ttnn::SmallVector<uint32_t> get_tile_strides(const ttnn::SmallVector<uint32_t>& shape) {
@@ -122,7 +141,7 @@ void pprint(const std::vector<T>& tensor, const std::vector<uint32_t>& dims) {
     std::cout << std::endl;
 }
 
-void tensor_flip_cpu(
+void flip_cpu(
     const std::vector<uint32_t>& src,
     std::vector<uint32_t>& dst,
     const std::vector<uint32_t>& tensor_shape,
@@ -147,48 +166,133 @@ void tensor_flip_cpu(
     }
 }
 
-int main(int argc, char** argv) {
-    constexpr uint32_t N = 1;
-
-    // constexpr uint32_t C = 2;
-    // constexpr uint32_t H = 128;
-    // constexpr uint32_t W = 224;
-
-    constexpr uint32_t C = 1;
-    constexpr uint32_t H = 64;
-    constexpr uint32_t W = 64;
-
-    constexpr uint32_t NUMEL = N * C * H * W;
-    constexpr uint32_t ELEMENT_SIZE = sizeof(uint32_t);
-    constexpr uint32_t TILE_SIZE = ELEMENT_SIZE * TILE_HW;
-
-    const std::vector<uint32_t> input_shape = {N, C, H, W};
-    const std::vector<uint32_t> dims = {2, 3};
-
-    std::vector<uint32_t> src_vec(NUMEL, 0);
-    std::vector<uint32_t> result_tt(NUMEL, 0);
-    std::vector<uint32_t> result_cpu(NUMEL, 0);
-
-    std::mt19937 gen(69);
-    std::uniform_int_distribution<int> dist(0, 9);
-    for (auto& v : src_vec) v = dist(gen);
-
-    tensor_flip_cpu(src_vec, result_cpu, input_shape, dims);
-
-    // fmt::print("src_vec:\n");
-    // pprint(src_vec, {1, 1, 32, 32});
-
-    src_vec = tilize_nfaces(src_vec, N * C * H, W);
-    // fmt::print("src_vec tilized:\n");
-    // pprint(src_vec, {1, 1, 32, 32});
-
-    // ------------------------------------------------------------------------
-    // TT part
-    // ------------------------------------------------------------------------
-    constexpr int device_id = 0;
-    IDevice* device = CreateDevice(device_id);
-    Program program = CreateProgram();
+void flip_rowmajor(
+    std::vector<uint32_t>& src_vec,
+    std::vector<uint32_t>& dst_vec,
+    const std::vector<uint32_t>& input_shape,
+    const std::vector<uint32_t>& dims,
+    IDevice* device) {
     CommandQueue& cq = device->command_queue();
+    Program program{};
+
+    ttnn::PageConfig page_config(ttnn::Layout::ROW_MAJOR);
+    ttnn::MemoryConfig memory_config(ttnn::TensorMemoryLayout::INTERLEAVED, ttnn::BufferType::DRAM);
+    ttnn::TensorLayout layout_config(ttnn::DataType::UINT32, page_config, memory_config);
+    ttnn::TensorSpec tensor_spec(ttnn::Shape(input_shape), layout_config);
+    ttnn::Tensor input_tensor = ttnn::Tensor::from_vector(src_vec, tensor_spec);
+    input_tensor = input_tensor.to_device(device);
+    ttnn::Tensor output_tensor = ttnn::Tensor::from_vector(dst_vec, tensor_spec);
+    output_tensor = output_tensor.to_device(device);
+    
+    uint32_t rank = input_tensor.logical_shape().rank();
+    uint32_t num_rows = input_tensor.physical_volume() / input_tensor.logical_shape()[-1];
+    std::vector<uint32_t> input_row_strides = get_row_strides(ttnn::Shape(input_shape));
+
+    // ------------------------------------------------------------------------
+    // 1) Split work to all available cores
+    // ------------------------------------------------------------------------    
+    auto core_grid = device->compute_with_storage_grid_size();
+    auto [num_cores,
+        all_cores,
+        core_group_1,
+        core_group_2,
+        num_rows_per_core_group_1,
+        num_rows_per_core_group_2] = split_work_to_cores(core_grid, num_rows);
+
+    fmt::print("core_grid: {}\n", core_grid);
+    fmt::print("num_cores: {}\n", num_cores);
+    fmt::print("all_cores: {}\n", all_cores);
+    fmt::print("core_group_1: {}\n", core_group_1);
+    fmt::print("core_group_2: {}\n", core_group_2);
+    fmt::print("num_rows_per_core_group_1: {}\n", num_rows_per_core_group_1);
+    fmt::print("num_rows_per_core_group_2: {}\n", num_rows_per_core_group_2);
+
+    DataFormat input_data_format = datatype_to_dataformat_converter(input_tensor.dtype());
+    uint32_t input_page_size = get_page_size(input_tensor);
+    uint32_t input_row_width = input_page_size / input_tensor.element_size();
+    uint32_t num_input_pages_to_read = 2;  // double buffering
+    uint32_t cb_size = num_input_pages_to_read * input_page_size;
+
+    auto cb_inp = CreateCircularBuffer(
+        program,
+        all_cores,
+        CircularBufferConfig(cb_size, {{CBIndex::c_0, input_data_format}})
+            .set_page_size(CBIndex::c_0, input_page_size));
+
+    // ------------------------------------------------------------------------
+    // 3) Set compile time arguments for kernels
+    // ------------------------------------------------------------------------
+
+
+    std::vector<uint32_t> reader_compile_time_args = {
+        (uint32_t)input_tensor.buffer()->is_dram(),
+        input_page_size,
+        input_row_width,
+        rank
+    };
+    std::vector<uint32_t> writer_compile_time_args = {
+        (uint32_t)output_tensor.buffer()->is_dram(),
+        input_page_size
+    };
+
+
+    // ------------------------------------------------------------------------
+    // 4) Create kernels
+    // ------------------------------------------------------------------------
+    KernelHandle reader_id = CreateKernel(
+        program,
+        OVERRIDE_KERNEL_PREFIX "tensor_flip/kernels/rowmajor_reader.cpp",
+        all_cores,
+        ReaderDataMovementConfig(reader_compile_time_args));
+
+    KernelHandle writer_id = CreateKernel(
+        program,
+        OVERRIDE_KERNEL_PREFIX "tensor_flip/kernels/rowmajor_writer.cpp",
+        all_cores,
+        WriterDataMovementConfig(writer_compile_time_args));
+
+    // ------------------------------------------------------------------------
+    // 5) Set runtime arguments for kernels
+    // ------------------------------------------------------------------------
+    std::vector<uint32_t> reader_runtime_args = {input_tensor.buffer()->address(), 0, 0};
+    std::vector<uint32_t> writer_runtime_args = {output_tensor.buffer()->address(), 0, 0};
+
+    auto work_groups = {
+        std::make_pair(core_group_1, num_rows_per_core_group_1),
+        std::make_pair(core_group_2, num_rows_per_core_group_2)};
+
+    uint32_t start_row = 0;
+    uint32_t end_row = 0;
+    for (const auto& [ranges, rows_per_core] : work_groups) {
+        for (const auto& range : ranges.ranges()) {
+            for (const auto& core : range) {
+                end_row += rows_per_core;
+
+                reader_runtime_args[1] = start_row;
+                reader_runtime_args[2] = end_row;
+                SetRuntimeArgs(program, reader_id, core, reader_runtime_args);
+
+                writer_runtime_args[1] = start_row;
+                writer_runtime_args[2] = end_row;
+                SetRuntimeArgs(program, writer_id, core, writer_runtime_args);
+
+                start_row += rows_per_core;
+            }
+        }
+    }
+
+    EnqueueProgram(cq, program, true);
+}
+
+void flip_tiled(
+    std::vector<uint32_t>& src_vec,
+    std::vector<uint32_t>& dst_vec,
+    const std::vector<uint32_t>& input_shape,
+    const std::vector<uint32_t>& dims,
+    IDevice* device) {
+
+    CommandQueue& cq = device->command_queue();
+    Program program{};
 
     ttnn::PageConfig page_config(ttnn::Layout::TILE);
     ttnn::MemoryConfig memory_config(ttnn::TensorMemoryLayout::INTERLEAVED, ttnn::BufferType::DRAM);
@@ -196,25 +300,9 @@ int main(int argc, char** argv) {
     ttnn::TensorSpec tensor_spec(ttnn::Shape(input_shape), layout_config);
     ttnn::Tensor input_tensor = ttnn::Tensor::from_vector(src_vec, tensor_spec);
     input_tensor = input_tensor.to_device(device);
-    ttnn::Tensor output_tensor = ttnn::Tensor::from_vector(result_tt, tensor_spec);
+    ttnn::Tensor output_tensor = ttnn::Tensor::from_vector(dst_vec, tensor_spec);
     output_tensor = output_tensor.to_device(device);
     
-    // fmt::print("input_tensor\n");
-    // input_tensor.print();
-    // pprint(std::vector<uint32_t>(input_tensor.to_vector<uint32_t>()), input_shape);
-
-    // ttnn::Tensor sliced_input_tensor = ttnn::slice(
-    //     ttnn::DefaultQueueId,
-    //     input_tensor,
-    //     ttnn::SmallVector<uint32_t>{0, 0, 0, 32}, // Start
-    //     ttnn::SmallVector<uint32_t>{1, 1, 32, 64}, // End
-    //     ttnn::SmallVector<uint32_t>{1, 1, 1, 1}); // Step
-    // Synchronize(device);
-
-    // fmt::print("sliced_input_tensor\n");
-    // sliced_input_tensor.print();
-    // pprint(std::vector<uint32_t>(sliced_input_tensor.to_vector<uint32_t>()), {1, 1, 32, 32});
-
     uint32_t rank = input_tensor.logical_shape().rank();
     uint32_t num_tiles = get_num_tiles(input_tensor);
     const auto& tile_shape = input_tensor.tensor_spec().tile().get_tile_shape();
@@ -227,17 +315,15 @@ int main(int argc, char** argv) {
     fmt::print("input_tile_strides: {}\n", input_tile_strides);
 
     // ------------------------------------------------------------------------
-    // 4) Split work to all available cores
+    // 1) Split work to all available cores
     // ------------------------------------------------------------------------
     auto core_grid = device->compute_with_storage_grid_size();
-    CoreRangeSet custom_core_range = CoreRangeSet(CoreRange({0, 0}, {3, 6})); // 4x7 = 28 cores  
-
     auto [num_cores,
         all_cores,
         core_group_1,
         core_group_2,
         num_tiles_per_core_group_1,
-        num_tiles_per_core_group_2] = split_work_to_cores(custom_core_range, num_tiles);
+        num_tiles_per_core_group_2] = split_work_to_cores(core_grid, num_tiles);
 
     fmt::print("core_grid: {}\n", core_grid);
     fmt::print("num_cores: {}\n", num_cores);
@@ -248,18 +334,20 @@ int main(int argc, char** argv) {
     fmt::print("num_tiles_per_core_group_2: {}\n", num_tiles_per_core_group_2);
 
     // ------------------------------------------------------------------------
-    // 3) Configure Circular Buffers
+    // 2) Configure circular buffers
     // ------------------------------------------------------------------------
-    const auto cb_data_format = tt::DataFormat::UInt32;
-    uint32_t cb_size = 2 * TILE_SIZE; // double buffering
+    DataFormat input_data_format = datatype_to_dataformat_converter(input_tensor.dtype());
+    uint32_t tile_size = input_tensor.element_size() * TILE_HW;
+    uint32_t num_tiles_to_read = 2; // double buffering
+    uint32_t cb_size = num_tiles_to_read * tile_size;
     auto cb_inp = CreateCircularBuffer(
         program,
         all_cores,
-        CircularBufferConfig(cb_size, {{CBIndex::c_0, cb_data_format}})
-            .set_page_size(CBIndex::c_0, TILE_SIZE));
+        CircularBufferConfig(cb_size, {{CBIndex::c_0, input_data_format}})
+            .set_page_size(CBIndex::c_0, tile_size));
 
     // ------------------------------------------------------------------------
-    // 2) Set compile-time arguments and create kernels
+    // 3) Set compile-time arguments
     // ------------------------------------------------------------------------
     std::vector<uint32_t> reader_compile_time_args = {
         (uint32_t)input_tensor.buffer()->is_dram(),
@@ -270,16 +358,21 @@ int main(int argc, char** argv) {
         face_shape[0],
         face_shape[1]  
     };
+    std::vector<uint32_t> writer_compile_time_args = {
+        (uint32_t)output_tensor.buffer()->is_dram()
+    };
 
-    auto reader_id = CreateKernel(
+    // ------------------------------------------------------------------------
+    // 4) Create kernels
+    // ------------------------------------------------------------------------
+    KernelHandle reader_id = CreateKernel(
         program,
         OVERRIDE_KERNEL_PREFIX "tensor_flip/kernels/reader_kernel.cpp",
         all_cores,
         ReaderDataMovementConfig(reader_compile_time_args)
     );
 
-    std::vector<uint32_t> writer_compile_time_args = {(uint32_t)output_tensor.buffer()->is_dram()};
-    auto writer_id = CreateKernel(
+    KernelHandle writer_id = CreateKernel(
         program,
         OVERRIDE_KERNEL_PREFIX "tensor_flip/kernels/writer_kernel.cpp",
         all_cores,
@@ -291,7 +384,7 @@ int main(int argc, char** argv) {
         std::make_pair(core_group_2, num_tiles_per_core_group_2)};
 
     // ------------------------------------------------------------------------
-    // 5) Set Runtime Arguments for Kernels
+    // 5) Set runtime arguments for kernels
     // ------------------------------------------------------------------------
     std::vector<uint32_t> reader_runtime_args = {input_tensor.buffer()->address(), 0, 0};
     std::vector<uint32_t> writer_runtime_args = {output_tensor.buffer()->address(), 0, 0};
@@ -326,20 +419,48 @@ int main(int argc, char** argv) {
         }
     }
 
-    // fmt::print("all_close: {}\n", ttnn::allclose<uint32_t>(
-    //     ttnn::Tensor::from_vector(result_cpu, tensor_spec), output_tensor.cpu(), 1e-5f, 1e-5f));
-    // fmt::print("enqueue program\n");
-    pprint(std::vector<uint32_t>(input_tensor.to_vector<uint32_t>()), input_shape);
-    fmt::print("=====================================================================\n");
+    EnqueueProgram(cq, program, true);
+}
 
-    EnqueueProgram(cq, program, false);
-    Finish(cq);
 
-    // fmt::print("finished execution\n");
-    // fmt::print("all_close: {}\n", ttnn::allclose<uint32_t>(
-    //     ttnn::Tensor::from_vector(result_cpu, tensor_spec), output_tensor.cpu(), 1e-5f, 1e-5f));
+int main(int argc, char** argv) {
+    constexpr uint32_t N = 1;
 
-    pprint(std::vector<uint32_t>(output_tensor.to_vector<uint32_t>()), input_shape);
+    // constexpr uint32_t C = 2;
+    // constexpr uint32_t H = 128;
+    // constexpr uint32_t W = 224;
+
+    constexpr uint32_t C = 1;
+    constexpr uint32_t H = 64;
+    constexpr uint32_t W = 64;
+
+    constexpr uint32_t NUMEL = N * C * H * W;
+
+    const std::vector<uint32_t> input_shape = {N, C, H, W};
+    const std::vector<uint32_t> dims = {2, 3};
+
+    std::vector<uint32_t> src_vec(NUMEL, 0);
+    std::vector<uint32_t> result_cpu(NUMEL, 0);
+    std::vector<uint32_t> result_tiled(NUMEL, 0);
+    std::vector<uint32_t> result_rowmajor(NUMEL, 0);
+
+    std::mt19937 gen(69);
+    std::uniform_int_distribution<int> dist(0, 9);
+    for (auto& v : src_vec) v = dist(gen);
+
+    flip_cpu(src_vec, result_cpu, input_shape, dims);
+
+    constexpr int device_id = 0;
+    IDevice* device = CreateDevice(device_id);
+
+    flip_rowmajor(src_vec, result_rowmajor, input_shape, dims, device);
+    src_vec = tilize_nfaces(src_vec, N * C * H, W);
+    flip_tiled(src_vec, result_rowmajor, input_shape, dims, device);
+
+    // CoreRangeSet custom_core_range = CoreRangeSet(CoreRange({0, 0}, {3, 6})); // 4x7 = 28 cores  
+    // pprint(std::vector<uint32_t>(input_tensor.to_vector<uint32_t>()), input_shape);
+    // fmt::print("=====================================================================\n");
+    // pprint(std::vector<uint32_t>(output_tensor.to_vector<uint32_t>()), input_shape);
     CloseDevice(device);
     return 0;
 }

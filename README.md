@@ -4,8 +4,8 @@
 ```
 
 ```
+pytest tests/ttnn/unit_tests/operations/test_flip.py::test_flip_rm
 pytest tests/ttnn/unit_tests/operations/test_flip.py::test_flip_tiled
-pytest tests/ttnn/unit_tests/operations/test_permute.py::test_permute_5d_tiled_basic
 ```
 
 ```
@@ -16,3 +16,5 @@ export TT_LOGGER_TYPES=Op
 export TT_LOGGER_LEVEL=Debug
 export TT_METAL_DPRINT_CORES="0,0"
 ```
+
+ps -e | grep pytest | awk '{print $1}' | xargs kill
