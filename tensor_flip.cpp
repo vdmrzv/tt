@@ -222,8 +222,6 @@ void flip_rowmajor(
     // ------------------------------------------------------------------------
     // 3) Set compile time arguments for kernels
     // ------------------------------------------------------------------------
-
-
     std::vector<uint32_t> reader_compile_time_args = {
         (uint32_t)input_tensor.buffer()->is_dram(),
         input_page_size,
@@ -234,7 +232,6 @@ void flip_rowmajor(
         (uint32_t)output_tensor.buffer()->is_dram(),
         input_page_size
     };
-
 
     // ------------------------------------------------------------------------
     // 4) Create kernels
@@ -282,6 +279,10 @@ void flip_rowmajor(
     }
 
     EnqueueProgram(cq, program, true);
+
+    pprint(std::vector<uint32_t>(input_tensor.to_vector<uint32_t>()), input_shape);
+    fmt::print("===============================================================\n");
+    pprint(std::vector<uint32_t>(output_tensor.to_vector<uint32_t>()), input_shape);
 }
 
 void flip_tiled(
@@ -356,7 +357,7 @@ void flip_tiled(
         tile_shape[0],
         tile_shape[1],
         face_shape[0],
-        face_shape[1]  
+        face_shape[1]
     };
     std::vector<uint32_t> writer_compile_time_args = {
         (uint32_t)output_tensor.buffer()->is_dram()
@@ -420,6 +421,9 @@ void flip_tiled(
     }
 
     EnqueueProgram(cq, program, true);
+    // pprint(std::vector<uint32_t>(input_tensor.to_vector<uint32_t>()), input_shape);
+    // fmt::print("===============================================================\n");
+    // pprint(std::vector<uint32_t>(output_tensor.to_vector<uint32_t>()), input_shape);
 }
 
 
@@ -454,13 +458,11 @@ int main(int argc, char** argv) {
     IDevice* device = CreateDevice(device_id);
 
     flip_rowmajor(src_vec, result_rowmajor, input_shape, dims, device);
-    src_vec = tilize_nfaces(src_vec, N * C * H, W);
-    flip_tiled(src_vec, result_rowmajor, input_shape, dims, device);
+    // src_vec = tilize_nfaces(src_vec, N * C * H, W);
+    // flip_tiled(src_vec, result_rowmajor, input_shape, dims, device);
 
-    // CoreRangeSet custom_core_range = CoreRangeSet(CoreRange({0, 0}, {3, 6})); // 4x7 = 28 cores  
-    // pprint(std::vector<uint32_t>(input_tensor.to_vector<uint32_t>()), input_shape);
-    // fmt::print("=====================================================================\n");
-    // pprint(std::vector<uint32_t>(output_tensor.to_vector<uint32_t>()), input_shape);
+    // CoreRangeSet custom_core_range = CoreRangeSet(CoreRange({0, 0}, {3, 6})); // 4x7 = 28 cores
+
     CloseDevice(device);
     return 0;
 }
